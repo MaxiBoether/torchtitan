@@ -7,9 +7,10 @@ TitanRL's generators, and the task's own tests grade the result. Verifiers runs 
 agent and the grading through the [Verifiers bridge](../README.md).
 
 > **Toy sandbox.** Local Docker keeps this example self-contained; it is not a sandbox
-> for real training. Containers run untrusted task code on the controller host and, by
-> default, share its network. For real training, plug in a mature sandbox as the
-> Verifiers runtime. Do not use `SubprocessConfig`: it runs the agent on the host.
+> for real training. Containers run untrusted task code on the controller host. They sit
+> on Docker's shared bridge network and reach the internet through the host. For real
+> training, plug in a mature sandbox as the Verifiers runtime. Do not use
+> `SubprocessConfig`: it runs the agent on the host.
 
 ## How it works
 
@@ -23,40 +24,40 @@ them.
         |                                                     |
         | 4. generate                                         | 7. batch
         |     +-- controller process (torchtitan.rl.train) ---|----------+
-        |     |  dataset -> VerifiersRollouter -> batcher                |
+        |     |  dataset -> VerifiersRollouter (CPU)                     |
         |     +---------------|-----------------^------------------------+
         |                     |                 |
         |               group v                 | finished group
-+-------|------- rollout worker processes (VerifiersRolloutWorker) ------+
-|  GenerationServer        send tasks, convert traces, score the group   |
-|  (localhost HTTP)                     |      ^                         |
-+-------^-------------------------------|------|-------------------------+
-        |                               |      |
-        | 4. token ids          1. task |      | 6. trace, reward
-+-------|-------------------------------v------|-------------------------+
-|  Verifiers env server (spawned process)                                |
-|  per rollout: interception server (chat messages <-> token ids)        |
-|               and a Docker runtime                                     |
-+-------^---------------------------------|------------------------------+
-        |                                 |
-        | 3. chat request   2. Terminus-2 |
-        |    each turn      5. test.sh    v
-+-------|---------- Docker container, one per rollout -------------------+
++-------|------- rollout worker processes (CPU), x worker_pool_size -----+
+|  GenerationServer  <-- 4. token ids --  Verifiers env, one episode per |
+|  (localhost HTTP)                       rollout: interception server   |
+|                                         (chat <-> token ids), Docker   |
+|  6. convert traces, score the group     runtime                        |
++---------------------------------------------^-------------|------------+
+                                              |             |
+                               3. chat request|             | 2. Terminus-2
+                                    each turn |             | 5. test.sh
++---------------------------------------------|-------------v------------+
+|  Docker container, one per rollout (CPU, run by Docker's daemon)       |
 |  Terminus-2 agent <--> tmux shell                                      |
 |  tests/test.sh -> reward file                                          |
 +------------------------------------------------------------------------+
 ```
 
+With the command in "Run", every box above runs on one host. With a launcher, the generators, and
+any trainer ranks past host 0, can move to other hosts. The `VerifiersRollouter` docstring draws an
+example.
+
 1. **Task.** The controller sends each group to a rollout worker process
-   (`VerifiersRolloutWorker`), which sends the sampled task to the env server once per
-   rollout in the group.
-2. **Agent.** The env server starts a container from the task's `docker_image` and runs
+   (`VerifiersRolloutWorker`), which runs one Verifiers episode per rollout in the group.
+2. **Agent.** The worker starts a container from the task's `docker_image` and runs
    Terminus-2 in it ([`harness.py`](./harness.py)). The agent types commands into a
    tmux shell and reads the screen back.
-3. **Model call.** Each agent turn is a chat request to Verifiers' interception server,
-   which records the turn in the rollout's trace.
-4. **Generation.** The request reaches the rollout worker's `GenerationServer` as token
-   ids. The server sends them to the vLLM generator that the router picks.
+3. **Model call.** Each agent turn is a chat request to the worker's Verifiers
+   interception server, which records the turn in the rollout's trace.
+4. **Generation.** The interception server renders the chat to token ids and sends them
+   to the worker's `GenerationServer`, which asks the router for a generator, then calls
+   that generator itself.
 5. **Grading.** When the agent stops, Verifiers runs the task's `tests/test.sh` in the
    container and reads the reward file it writes.
 6. **Trace.** The rollout worker turns the trace into rollout turns, with the exact
@@ -74,7 +75,7 @@ starts with training and runs beside it (`ValidationConfig`).
 | Terminus-2 harness and the program it runs in the container, copied from Verifiers 0.3.1 to expose reasoning in the history and summarization | [`harness.py`](./harness.py), [`terminus_harness.py`](./terminus_harness.py) |
 | Verifiers' Harbor taskset for Terminal-Bench and TMax; Verifiers imports it through `torchtitan_verifiers_terminal_bench/` | [`taskset.py`](./taskset.py) |
 | Offline TMax to Harbor task conversion | [`prepare_tmax.py`](./prepare_tmax.py) |
-| Bridge: task dataset, env server, generation server, trace to turns | [Verifiers integration](../README.md) |
+| Bridge: task dataset, rollout worker, generation server, trace to turns | [Verifiers integration](../README.md) |
 | CPU tests | `tests/rl/unit_tests/cpu/test_verifiers_terminal_bench*.py` |
 
 ## Run
@@ -138,9 +139,8 @@ python -m torchtitan.rl.examples.verifiers.terminal_bench.prepare_tmax \
 - **A grader that never ran scores 0.** Verifiers ignores `tests/test.sh`'s exit status
   and scores a missing or unreadable reward file as 0, the same as a failed task.
   Terminal-Bench 2.1 test scripts install their test tools (`apt-get`, `uv`, pytest)
-  when they run, so the container needs outbound network while grading. With its
-  default network policy, Verifiers' Docker runtime uses host networking, so the
-  controller host needs that access.
+  when they run, so the container needs outbound network while grading. Its traffic
+  leaves through the controller host, so that host needs the access.
 - **The run fails after 10 untrainable batches.** A group whose samples all get the
   same reward is dropped (`TrainingSampleBuilder.drop_zero_std_reward_groups`). The
   batcher warns after each batch's worth of such groups in a row and raises
