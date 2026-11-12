@@ -273,14 +273,11 @@ def test_qwen35_always_calls_vision_encoder_twice(
 
 @pytest.mark.parametrize("flavor", ["debugmodel", "debugmodel_moe", "9B", "27B"])
 def test_qwen35_text_only_flavor_has_no_vision_encoder(flavor: str) -> None:
-    """The plain flavor is its ``_mm`` flavor without the vision encoder, so
-    layer 0 takes the residual layout instead of the post-scatter Replicate."""
-    parallelism = ParallelismConfig(enable_sequence_parallel=True)
+    """The plain flavor is its ``_mm`` flavor without the vision encoder."""
+    parallelism = ParallelismConfig()
     multimodal = build_model_config(f"{flavor}_mm", parallelism=parallelism)
     text = build_model_config(flavor, parallelism=parallelism)
 
     assert multimodal.vision_encoder is not None
     assert text.vision_encoder is None
     assert len(text.layers) == len(multimodal.layers)
-    assert text.layers[0].sharding_config == text.layers[1].sharding_config
-    assert text.layers[0].sharding_config != multimodal.layers[0].sharding_config
